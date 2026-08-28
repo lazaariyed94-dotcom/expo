@@ -191,7 +191,7 @@ Then select the loaded face with the `fontWeight` and `fontStyle` style props:
 
 Declare every face of a family in one call. A `fontFamily` loads once, so a later `loadAsync` or `useFonts` call for a name that is already loaded adds no faces to it. This also applies across the two call styles: after `useFonts({ Inter: regular })`, passing an array for `Inter` loads nothing more.
 
-Declare `weight` and `style` on every face. Web needs both values, and explicit values keep the three platforms in agreement.
+Declare `weight` and `style` on every face of a multi-face family. Web needs both values, and explicit values keep the three platforms in agreement. A single variable font file is the exception: leave its `style` unset, and leave its `weight` unset or declare a weight range such as `'100 900'`, so Android instances the font's `wght` axis for every `fontWeight` instead of pinning it to one weight.
 
 Platform notes:
 
