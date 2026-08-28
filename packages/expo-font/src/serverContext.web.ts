@@ -75,7 +75,8 @@ export function getLoadedServerFonts(): string[] {
   if (!store) {
     return [];
   }
-  return [...store.values()].map(({ name }) => name);
+  // The store holds one entry per face; report each family once, like the browser path.
+  return [...new Set([...store.values()].map(({ name }) => name))];
 }
 
 export function isServerFontLoaded(name: string): boolean {
