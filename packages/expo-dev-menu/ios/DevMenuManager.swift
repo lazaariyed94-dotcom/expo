@@ -56,6 +56,28 @@ class DevMenuCacheContainer<T> {
 }
 
 /**
+ Thread-safe storage for `DevMenuManager.registeredCallbacks`.
+
+ `DevMenuManager` is a process-wide singleton, but app contexts are not: `DevMenuModule.OnDestroy`
+ resets the callback list from the outgoing context's JS thread while the incoming context's JS
+ thread appends to it via `addDevMenuCallbacks`, which happens on every dev-client reload.
+ Unsynchronized, concurrent mutation of a plain `Array` corrupts its buffer and crashes the process
+ with SIGSEGV. Extracting the storage also makes it testable without the singleton, whose `init`
+ creates a window and starts a packager connection.
+ */
+final class DevMenuCallbacksRegistry {
+  private let storage = Mutex<[DevMenuManager.Callback]>([])
+
+  var callbacks: [DevMenuManager.Callback] {
+    storage.withLock { $0 }
+  }
+
+  func replace(with callbacks: [DevMenuManager.Callback]) {
+    storage.withLock { $0 = callbacks }
+  }
+}
+
+/**
  Manages the dev menu and provides most of the public API.
  */
 @objc
@@ -74,10 +96,17 @@ open class DevMenuManager: NSObject {
   var canLaunchDevMenuOnStart = true
   @objc public var isReactAppRunning = false
 
+  private let appContextLock = NSLock()
+  private weak var _currentAppContext: AppContext?
+
   /**
    The AppContext for the currently running React app. Set by DevMenuModule.OnCreate.
    */
-  public private(set) weak var currentAppContext: AppContext?
+  public var currentAppContext: AppContext? {
+    appContextLock.lock()
+    defer { appContextLock.unlock() }
+    return _currentAppContext
+  }
 
   @objc public var configuration = DevMenuConfiguration()
 
@@ -179,7 +208,9 @@ open class DevMenuManager: NSObject {
 
   @objc
   public func setAppContext(_ appContext: AppContext?) {
-    currentAppContext = appContext
+    appContextLock.lock()
+    _currentAppContext = appContext
+    appContextLock.unlock()
     if appContext != nil {
       isReloading = false
       lastReloadEventAt = Date()
@@ -198,14 +229,22 @@ open class DevMenuManager: NSObject {
    Clears the app context, but only if `context` is still the active one.
    On reload the incoming context's `OnCreate` can run before the outgoing context's
    `OnDestroy`, so an unconditional reset would wipe the new context and leave the dev
-   menu unable to open.
+   menu unable to open. The check and the clear happen under one lock so the two can't
+   interleave with a concurrent `setAppContext` on another thread.
    */
   @objc
   public func clearAppContext(current context: AppContext?) {
-    if currentAppContext != nil && currentAppContext !== context {
+    appContextLock.lock()
+    let shouldClear = _currentAppContext == nil || _currentAppContext === context
+    if shouldClear {
+      _currentAppContext = nil
+    }
+    appContextLock.unlock()
+    guard shouldClear else {
       return
     }
-    setAppContext(nil)
+    isReactAppRunning = false
+    updateAutoLaunchObserver()
   }
 
   @objc
@@ -470,9 +509,18 @@ open class DevMenuManager: NSObject {
     callbacksSubject.eraseToAnyPublisher()
   }
 
-  public var registeredCallbacks: [Callback] = [] {
-    didSet {
-      callbacksSubject.send(registeredCallbacks)
+  private let callbacksRegistry = DevMenuCallbacksRegistry()
+
+  public var registeredCallbacks: [Callback] {
+    get {
+      callbacksRegistry.callbacks
+    }
+    set {
+      callbacksRegistry.replace(with: newValue)
+      // Sent on the main queue so concurrent writers can't send into the subject at once.
+      DispatchQueue.main.async { [weak self] in
+        self?.callbacksSubject.send(newValue)
+      }
     }
   }
 

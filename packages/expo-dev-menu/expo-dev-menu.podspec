@@ -115,6 +115,11 @@ Pod::Spec.new do |s|
     test_spec.platforms = {
       :ios => '16.4'
     }
+    # The linked static libs contain C++ but the test bundle has no C++ sources,
+    # so the C++ runtime must be linked explicitly
+    test_spec.pod_target_xcconfig = {
+      'OTHER_LDFLAGS' => '$(inherited) -lc++'
+    }
   end
 
   s.test_spec 'UITests' do |test_spec|
