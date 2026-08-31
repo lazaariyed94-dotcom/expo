@@ -35,6 +35,11 @@
 // Storing events per app. Schema: { "<appId>": [<eventIds...>] }
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *events;
 
+// Guards all of the above collections against concurrent access from different React instances'
+// JS threads and OS background-launch callbacks. Recursive so internal helpers may call one
+// another while it's held.
+@property (nonatomic, strong) NSRecursiveLock *lock;
+
 @end
 
 @implementation EXTaskService
@@ -60,6 +65,7 @@
     _headlessTaskManagers = [NSMapTable strongToWeakObjectsMapTable];
     _eventsQueues = [NSMutableDictionary new];
     _events = [NSMutableDictionary new];
+    _lock = [NSRecursiveLock new];
   }
   return self;
 }
@@ -134,16 +140,18 @@
     @throw [NSException exceptionWithName:@"E_INVALID_TASK_CONSUMER" reason:reason userInfo:errorInfo];
   }
   
+  [_lock lock];
   NSMutableDictionary *appTasks = [[self _getTasksForAppId:appId] mutableCopy];
-  
+
   [appTasks removeObjectForKey:taskName];
-  
+
   if (appTasks.count == 0) {
     [_tasks removeObjectForKey:appId];
   } else {
     [_tasks setObject:appTasks forKey:appId];
   }
-  
+  [_lock unlock];
+
   if ([task.consumer respondsToSelector:@selector(didUnregister)]) {
     [task.consumer didUnregister];
   }
@@ -155,8 +163,10 @@
  */
 - (void)unregisterAllTasksForAppId:(NSString *)appId
 {
+  [_lock lock];
   NSDictionary *appTasks = _tasks[appId];
-  
+  [_lock unlock];
+
   if (appTasks) {
     // Call `didUnregister` on task consumers
     for (EXTask *task in [appTasks allValues]) {
@@ -164,9 +174,11 @@
         [task.consumer didUnregister];
       }
     }
-    
+
+    [_lock lock];
     [_tasks removeObjectForKey:appId];
-    
+    [_lock unlock];
+
     // Remove the app from the config in user defaults.
     [self _removeFromConfigAppWithId:appId];
   }
@@ -223,28 +235,42 @@
   }
   
   // Inform requests about finished tasks
-  for (EXTaskExecutionRequest *request in [_requests copy]) {
+  [_lock lock];
+  NSArray<EXTaskExecutionRequest *> *requests = [_requests copy];
+  [_lock unlock];
+
+  for (EXTaskExecutionRequest *request in requests) {
     if ([request isIncludingTask:task]) {
       [request task:task didFinishWithResult:result];
     }
   }
-  
+
   // Remove event and maybe invalidate related app record
+  [_lock lock];
   NSMutableArray *appEvents = _events[appId];
-  
+  BOOL shouldMaybeInvalidate = NO;
+
   if (appEvents) {
     [appEvents removeObject:eventId];
-    
+
     if (appEvents.count == 0) {
       [self->_events removeObjectForKey:appId];
-      
-      // Invalidate app record but after 1 second delay so we can still take batched events.
-      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!self->_events[appId]) {
-          [self _invalidateAppWithId:appId];
-        }
-      });
+      shouldMaybeInvalidate = YES;
     }
+  }
+  [_lock unlock];
+
+  if (shouldMaybeInvalidate) {
+    // Invalidate app record but after 1 second delay so we can still take batched events.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+      [self->_lock lock];
+      BOOL stillEmpty = self->_events[appId] == nil;
+      [self->_lock unlock];
+
+      if (stillEmpty) {
+        [self _invalidateAppWithId:appId];
+      }
+    });
   }
 }
 
@@ -256,23 +282,23 @@
   // Having two tables for them is to prevent race condition problems,
   // when both foreground and background apps are launching at the same time.
   BOOL isHeadless = [taskManager isRunningInHeadlessMode];
+
+  [_lock lock];
   NSMapTable *taskManagersTable = isHeadless ? _headlessTaskManagers : _taskManagers;
-  
+
   // Set task manager in appropriate table.
   [taskManagersTable setObject:taskManager forKey:appId];
-  
-  // Execute events waiting for the task manager.
-  NSMutableArray *appEventQueue = _eventsQueues[appId];
-  
-  if (appEventQueue) {
-    for (NSDictionary *body in appEventQueue) {
-      [taskManager executeWithBody:body];
-    }
-  }
-  
-  // Remove events queue for that app.
+
+  // Snapshot events waiting for the task manager and remove the queue for that app.
+  NSArray<NSDictionary *> *appEventQueue = [_eventsQueues[appId] copy];
   [_eventsQueues removeObjectForKey:appId];
-  
+  [_lock unlock];
+
+  // Execute events waiting for the task manager.
+  for (NSDictionary *body in appEventQueue) {
+    [taskManager executeWithBody:body];
+  }
+
   if (!isHeadless) {
     // Maybe update app url in user defaults. It might change only in non-headless mode.
     [self _maybeUpdateAppUrl:appUrl forAppId:appId];
@@ -296,26 +322,34 @@
   NSLog(@"EXTaskService: Executing task '%@' for app '%@'.", task.name, task.appId);
   
   // Save an event so we can keep tracking events for this app
+  [_lock lock];
   NSMutableArray *appEvents = _events[task.appId] ?: [NSMutableArray new];
   [appEvents addObject:executionInfo[@"eventId"]];
   [_events setObject:appEvents forKey:task.appId];
-  
+  [_lock unlock];
+
   if (taskManager != nil) {
     // Task manager is initialized and can execute events
     [taskManager executeWithBody:body];
     return;
   }
-  
-  if (_appRecords[task.appId] == nil) {
+
+  [_lock lock];
+  BOOL hasAppRecord = _appRecords[task.appId] != nil;
+  [_lock unlock];
+
+  if (!hasAppRecord) {
     // No app record yet - let's spin it up!
     [self _loadAppWithId:task.appId appUrl:task.appUrl];
   }
-  
+
   // App record for that app exists, but it's not fully loaded as its task manager is not there yet.
   // We need to add event's body to the queue from which events will be executed once the task manager is ready.
+  [_lock lock];
   NSMutableArray *appEventsQueue = _eventsQueues[task.appId] ?: [NSMutableArray new];
   [appEventsQueue addObject:body];
   [_eventsQueues setObject:appEventsQueue forKey:task.appId];
+  [_lock unlock];
   return;
 }
 
@@ -382,7 +416,10 @@
  */
 - (NSDictionary<NSString *, EXTask *> *)_getTasksForAppId:(NSString *)appId
 {
-  return _tasks[appId];
+  [_lock lock];
+  NSDictionary<NSString *, EXTask *> *appTasks = _tasks[appId];
+  [_lock unlock];
+  return appTasks;
 }
 
 /**
@@ -394,16 +431,19 @@
                             consumerClass:(Class)consumerClass
                                   options:(nullable NSDictionary *)options
 {
-  NSMutableDictionary *appTasks = [[self _getTasksForAppId:appId] mutableCopy] ?: [NSMutableDictionary new];
   EXTask *task = [[EXTask alloc] initWithName:taskName
                                         appId:appId
                                        appUrl:appUrl
                                 consumerClass:consumerClass
                                       options:options
                                      delegate:self];
-  
+
+  [_lock lock];
+  NSMutableDictionary *appTasks = [[self _getTasksForAppId:appId] mutableCopy] ?: [NSMutableDictionary new];
   [appTasks setObject:task forKey:task.name];
   [_tasks setObject:appTasks forKey:appId];
+  [_lock unlock];
+
   [task.consumer didRegisterTask:task];
   return task;
 }
@@ -472,11 +512,16 @@
 
 - (void)_iterateTasksUsingBlock:(void(^)(id<EXTaskInterface> task))block
 {
-  for (NSString *appId in _tasks) {
-    NSDictionary *appTasks = [self _getTasksForAppId:appId];
-    
+  // Snapshot so we can call out to task consumers below without holding the lock.
+  [_lock lock];
+  NSDictionary<NSString *, NSDictionary *> *tasksSnapshot = [_tasks copy];
+  [_lock unlock];
+
+  for (NSString *appId in tasksSnapshot) {
+    NSDictionary *appTasks = tasksSnapshot[appId];
+
     for (NSString *taskName in appTasks) {
-      id<EXTaskInterface> task = [self _getTaskWithName:taskName forAppId:appId];
+      id<EXTaskInterface> task = appTasks[taskName];
       block(task);
     }
   }
@@ -528,12 +573,16 @@
       callback(results);
     }
     
+    [self->_lock lock];
     [self->_requests removeObject:request];
+    [self->_lock unlock];
     request = nil;
   }];
-  
+
+  [_lock lock];
   [_requests addObject:request];
-  
+  [_lock unlock];
+
   [self _iterateTasksUsingBlock:^(id<EXTaskInterface> task) {
     if ([task.consumer.class respondsToSelector:@selector(supportsLaunchReason:)] && [task.consumer.class supportsLaunchReason:launchReason]) {
       [self _addTask:task toRequest:request withInfo:userInfo];
@@ -557,16 +606,20 @@
     appRecord = [appLoader loadAppWithUrl:appUrl options:nil callback:^(BOOL success, NSError *error) {
       if (!success) {
         NSLog(@"EXTaskService: Loading app '%@' from url '%@' failed. Error description: %@", appId, appUrl, error.description);
+        [self->_lock lock];
         [self->_events removeObjectForKey:appId];
         [self->_eventsQueues removeObjectForKey:appId];
         [self->_appRecords removeObjectForKey:appId];
-        
+        [self->_lock unlock];
+
         // Host unreachable? Unregister all tasks for that app.
         [self unregisterAllTasksForAppId:appId];
       }
     }];
-    
+
+    [_lock lock];
     [_appRecords setObject:appRecord forKey:appId];
+    [_lock unlock];
   }
 }
 
@@ -575,8 +628,10 @@
  */
 - (id<EXTaskManagerInterface>)_taskManagerForAppId:(NSString *)appId
 {
-  id<EXTaskManagerInterface> taskManager = [_taskManagers objectForKey:appId];
-  return taskManager ?: [_headlessTaskManagers objectForKey:appId];
+  [_lock lock];
+  id<EXTaskManagerInterface> taskManager = [_taskManagers objectForKey:appId] ?: [_headlessTaskManagers objectForKey:appId];
+  [_lock unlock];
+  return taskManager;
 }
 
 /**
@@ -667,12 +722,17 @@
 
 - (void)_invalidateAppWithId:(NSString *)appId
 {
+  [_lock lock];
   id<UMAppRecordInterface> appRecord = _appRecords[appId];
-  
+  [_lock unlock];
+
   if (appRecord) {
     [appRecord invalidate];
+
+    [_lock lock];
     [_appRecords removeObjectForKey:appId];
     [_headlessTaskManagers removeObjectForKey:appId];
+    [_lock unlock];
   }
 }
 
