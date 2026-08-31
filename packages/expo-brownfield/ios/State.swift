@@ -84,13 +84,24 @@ public final class BrownfieldStateInternal {
       return
     }
     deletedKeys.remove(key)
+    let module = expoModule
     lock.unlock()
 
-    expoModule?.notifyKeyRecreated(key)
+    module?.notifyKeyRecreated(key)
   }
 
-  public func setExpoModule(_ expoModule: ExpoBrownfieldStateModule?) {
+  public func setExpoModule(_ expoModule: ExpoBrownfieldStateModule) {
+    lock.lock()
     self.expoModule = expoModule
+    lock.unlock()
+  }
+
+  public func clearExpoModule(_ expoModule: ExpoBrownfieldStateModule) {
+    lock.lock()
+    if self.expoModule === expoModule {
+      self.expoModule = nil
+    }
+    lock.unlock()
   }
 
   public func notifySubscribers(_ key: String, _ value: Any?) {
