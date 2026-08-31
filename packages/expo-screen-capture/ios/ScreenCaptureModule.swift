@@ -20,8 +20,10 @@ public final class ScreenCaptureModule: Module {
     Events(onScreenshotEventName)
 
     OnDestroy {
-      allowScreenshots()
-      disableAppSwitcherProtection()
+      DispatchQueue.main.async {
+        self.allowScreenshots()
+        self.disableAppSwitcherProtection()
+      }
     }
 
     OnStartObserving {
